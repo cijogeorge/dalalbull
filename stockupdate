@@ -1,0 +1,318 @@
+#!/usr/bin/perl
+
+use WWW::Mechanize;
+use DBI;
+use SQL::Abstract;
+$mech = WWW::Mechanize->new(agent => "IE 3.0");
+$mech->get("http://nseindia.com/content/equities/niftywatch.htm");
+$con= $mech->response->content;
+$con =~ m/<table (.*?)>(.*?)<\/table>/i;
+$con = $2;
+$db="inexcel_excel";
+$user="inexcel_excel";
+$pass="excel2k9";
+$host="localhost";
+$dbh = DBI->connect("DBI:mysql:$db:$host", $user, $pass) or die "Can't connect to the DB: $DBI::error\n"; 
+while(true)
+{
+ $mech->get("http://nseindia.com/content/equities/niftywatch.htm");
+ $con= $mech->response->content;
+ $con =~ m/<table (.*?)>(.*?)<\/table>/i;
+ my $sql = qq{ TRUNCATE TABLE `stock_data`  };
+ my $sth = $dbh->prepare($sql);
+ $sth->execute();
+ while($con =~ m{<tr><td class="t0"><a href=".*?">(.*?)</a></td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t1">(.*?)</td><td class="t2" width="63">(.*?)</td><td class="t0">(.*?)</td></tr>}ig)
+ {
+  my $sql = qq{ INSERT INTO `stock_data`(`Name` ,`Current_price` ,`high`,`low` ,`open` ,`prev_close` ,`per_change` ,`total_trd_qty` ,`turnover`) VALUES ('$1', '$5', '$3', '$4', '$2', '$6' , '$7', '$8' , '$9'); };
+  my $sth = $dbh->prepare($sql);
+  $sth->execute();
+ }
+ ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+ $time1=sprintf("%02d%02d",$hour,$min);
+ $time2=sprintf("%02d/%02d/%4d, %02d:%02d:%02d\n",$mday,$mon+1,$year+1900,$hour,$min,$sec);
+ 
+ if($time1>=1530)
+ {
+  my $sql = qq{ SELECT excelid,company,quantity FROM transactions WHERE buy_ss='Short Sell' };
+  my $sth = $dbh->prepare($sql);
+  $sth->execute();
+  my( $excelid,$company, $quantity);
+  $sth->bind_columns( undef, \$excelid, \$company, \$quantity);
+  while( $sth->fetch() ) 
+  {
+   $ret=&sell_sc($excelid,$company,$quantity,"Short Cover");
+  }
+  $sql = SQL::Abstract->new;
+  ($stmt, @bind) = $sql->delete('pending');
+  $sth = $dbh->prepare($stmt);
+  $sth->execute(@bind);    
+  $sth->finish();
+  exit;
+ }
+ else
+ {
+  my $sql = qq{ SELECT * FROM pending};
+  my $sth = $dbh->prepare($sql);
+  $sth->execute();
+  my($id,$excelid,$company,$quantity,$price,$type);
+  $sth->bind_columns( undef, \$id,\$excelid, \$company, \$quantity, \$price, \$type);
+  while( $sth->fetch() ) 
+  {
+   $sql1 = qq{ SELECT Current_price FROM stock_data WHERE Name='$company'};
+   $sth1 = $dbh->prepare($sql1);
+   $sth1->execute();
+   my( $current_price );
+   $sth1->bind_columns( undef,\$current_price );
+   $sth1->fetch();
+   $sth1->finish();
+   if($current_price)
+   {
+    if($current_price<=$price)
+    {
+     if($type eq "Buy")
+     { 
+      $ret=&buy_ss($excelid,$company,$quantity,$type);
+     }
+     elsif($type eq "Short Cover")
+     {
+      $ret=&sell_sc($excelid,$company,$quantity,$type);
+     }
+    }
+    elsif($current_price>=$price)
+    {
+     if($type eq "Sell")
+     { 
+      $ret=&sell_sc($excelid,$company,$quantity,$type);
+     }
+     elsif($type eq "Short Sell")
+     {
+     $ret=&buy_ss($excelid,$company,$quantity,$type);
+     }
+    }
+    if($ret==1)
+    {
+     $ret=0;
+     $sql2 = SQL::Abstract->new;
+     %where=(id=>$id,excelid=>$excelid,company=>$company,quantity=>$quantity,price=>$price,type=>$type);
+     ($stmt2, @bind2) = $sql2->delete('pending',\%where);
+     $sth2 = $dbh->prepare($stmt2);
+     $sth2->execute(@bind2);  
+     $sth2->finish(); 
+    }
+   }
+   $sth->bind_columns( undef, \$id,\$excelid, \$company, \$quantity, \$price, \$type);
+  }
+  $sth->finish();
+ }
+ sleep(10);
+}
+sub buy_ss
+{
+ my $excelid=$_[0];
+ my $company=$_[1];
+ my $quantity=$_[2];
+ my $b_ss=$_[3];
+ my $sql = qq{ SELECT Current_price  FROM stock_data WHERE Name='$company'};
+ my $sth = $dbh->prepare($sql);
+ $sth->execute();
+ my( $current_price );
+ $sth->bind_columns( undef,\$current_price );
+ $sth->fetch();
+ if($current_price)
+ {
+  $sql = qq{ SELECT cash_bal,margin,no_trans FROM portfolio WHERE excelid='$excelid'};
+  $sth = $dbh->prepare($sql);
+  $sth->execute();
+  my( $cash_bal,$margin,$no_trans );
+  $sth->bind_columns( undef,\$cash_bal,\$margin, \$no_trans );
+  $sth->fetch();
+  if($no_trans+1<=100)
+  {
+   $brokerage=((0.1/100)*$current_price)*$quantity;
+  }
+  elsif($no_trans+1<=1000)
+  {
+   $brokerage=((0.2/100)*$current_price)*$quantity;
+  }
+  else
+  {
+   $brokerage=((0.5/100)*$current_price)*$quantity;
+  }
+  if((($cash_bal-$margin-$brokerage)>0 && ($cash_bal-$margin-$brokerage)>=($current_price*$quantity) && $b_ss eq "Buy") || (($cash_bal-$margin-$brokerage>=($current_price*$quantity)/2) && $b_ss eq "Short Sell"))
+  {
+   $sql = qq{ SELECT value,quantity FROM transactions WHERE excelid='$excelid' AND company='$company' AND buy_ss='$b_ss' };
+   $sth = $dbh->prepare($sql);
+   $sth->execute();
+   my( $value,$old_quantity );
+   $sth->bind_columns( undef,\$value,\$old_quantity );
+   $sth->fetch();
+   if($value&&$old_quantity)
+   {
+    $value=$value+($quantity*$current_price);
+    $new_quantity=$old_quantity+$quantity;  
+    $sql = SQL::Abstract->new;
+    %data=(quantity=>$new_quantity,value=>$value);
+    %where=(excelid=>$excelid,company=>$company,buy_ss=>$b_ss);
+    ($stmt, @bind) = $sql->update('transactions',\%data,\%where);
+    $sth = $dbh->prepare($stmt);
+    $sth->execute(@bind); 
+   }
+   else
+   {
+    $value=$quantity*$current_price;
+    $sql = SQL::Abstract->new;
+    %data=(excelid=>$excelid,company=>$company,buy_ss=>$b_ss,quantity=>$quantity,value=>$value);
+    ($stmt, @bind) = $sql->insert('transactions',\%data);
+    $sth = $dbh->prepare($stmt);
+    $sth->execute(@bind);
+   }
+   if($b_ss eq "Buy")
+   {
+    $cash_bal=$cash_bal-($quantity*$current_price);
+    $sql = SQL::Abstract->new;
+    %data=(cash_bal=>$cash_bal);
+    %where=(excelid=>$excelid);
+    ($stmt, @bind) = $sql->update('portfolio',\%data,\%where);
+    $sth = $dbh->prepare($stmt);
+    $sth->execute(@bind);    
+   }
+   elsif($b_ss eq "Short Sell")
+   {
+    $margin=$margin+($quantity*$current_price)/2;
+    $sql = SQL::Abstract->new;
+    %data=(margin=>$margin);
+    %where=(excelid=>$excelid);
+    ($stmt, @bind) = $sql->update('portfolio',\%data,\%where);
+    $sth = $dbh->prepare($stmt);
+    $sth->execute(@bind);   
+   }
+   $sql = SQL::Abstract->new;
+   %data=(excelid=>$excelid,time=>$time2,company=>$company,type=>$b_ss,quantity=>$quantity,price=>$current_price);
+   ($stmt, @bind) = $sql->insert('history',\%data);
+   $sth = $dbh->prepare($stmt);
+   $sth->execute(@bind); 
+   $sql = qq{ SELECT cash_bal FROM portfolio WHERE excelid='$excelid'};
+   $sth = $dbh->prepare($sql);
+   $sth->execute();
+   my( $cash_bal);
+   $sth->bind_columns( undef,\$cash_bal);
+   $sth->fetch();
+   $no_trans++;   
+   $cash_bal=$cash_bal-$brokerage;
+   $sql = SQL::Abstract->new;
+   %data=(cash_bal=>$cash_bal,no_trans=>$no_trans);
+   %where=(excelid=>$excelid);
+   ($stmt, @bind) = $sql->update('portfolio',\%data,\%where);
+   $sth = $dbh->prepare($stmt);
+   $sth->execute(@bind);
+   $sth->finish();
+   return 1;
+  }
+ }
+ $sth->finish();
+ return 0; 
+} 
+sub sell_sc
+{
+ my $b_ss;
+ my $excelid=$_[0];
+ my $company=$_[1];
+ my $quantity=$_[2];
+ my $s_sc=$_[3];
+ if($s_sc eq "Sell") { $b_ss="Buy"; }
+ else { $b_ss="Short Sell"; }
+ my $sql = qq{ SELECT Current_price  FROM stock_data WHERE Name='$company'};
+ my $sth = $dbh->prepare($sql);
+ $sth->execute();
+ my( $current_price );
+ $sth->bind_columns( undef,\$current_price );
+ $sth->fetch();
+ if($current_price)
+ {
+  $sql = qq{ SELECT value,quantity FROM transactions WHERE excelid='$excelid' AND company='$company' AND buy_ss='$b_ss' };
+  $sth = $dbh->prepare($sql);
+  $sth->execute();
+  my( $value,$old_quantity );
+  $sth->bind_columns( undef,\$value,\$old_quantity );
+  $sth->fetch();
+  if($quantity<=$old_quantity)
+  {
+   $new_quantity=$old_quantity-$quantity;
+   $old_total=($value/$old_quantity)*$quantity;
+   $new_val=$value-$old_total;
+   if($new_quantity==0)
+   {
+    $sql = SQL::Abstract->new;
+    %where=(excelid=>$excelid,company=>$company,buy_ss=>$b_ss);
+    ($stmt, @bind) = $sql->delete('transactions',\%where);
+    $sth = $dbh->prepare($stmt);
+    $sth->execute(@bind);
+   }
+   else
+   {
+    $sql = SQL::Abstract->new;
+    %data=(quantity=>$new_quantity,value=>$new_val);
+    %where=(excelid=>$excelid,company=>$company,buy_ss=>$b_ss);
+    ($stmt, @bind) = $sql->update('transactions',\%data,\%where);
+    $sth = $dbh->prepare($stmt);
+    $sth->execute(@bind);   
+   } 
+   $sql = qq{ SELECT cash_bal,margin FROM portfolio WHERE excelid='$excelid'};
+   $sth = $dbh->prepare($sql);
+   $sth->execute();
+   my( $old_cash_bal,$margin );
+   $sth->bind_columns( undef,\$old_cash_bal,\$margin );
+   $sth->fetch();
+   if($s_sc eq "Short Cover")
+   {
+    $sc_profit=$old_total-($quantity*$current_price);
+    $cash_bal=$old_cash_bal+$sc_profit;
+    $margin=($margin-($value/2))+($new_val/2);
+   }
+   elsif($s_sc eq "Sell")
+   {
+    $cash_bal=$old_cash_bal+($quantity*$current_price);
+   }  
+   $sql = SQL::Abstract->new;
+   %data=(cash_bal=>$cash_bal,margin=>$margin);
+   %where=(excelid=>$excelid);
+   ($stmt, @bind) = $sql->update('portfolio',\%data,\%where);
+   $sth = $dbh->prepare($stmt);
+   $sth->execute(@bind); 
+   $sql = SQL::Abstract->new;
+   %data=(excelid=>$excelid,time=>$time2,company=>$company,type=>$s_sc,quantity=>$quantity,price=>$current_price);
+   ($stmt, @bind) = $sql->insert('history',\%data);
+   $sth = $dbh->prepare($stmt);
+   $sth->execute(@bind);   
+   $sql = qq{ SELECT cash_bal,no_trans FROM portfolio WHERE excelid='$excelid'};
+   $sth = $dbh->prepare($sql);
+   $sth->execute();
+   my( $cash_bal,$no_trans );
+   $sth->bind_columns( undef,\$cash_bal,\$no_trans);
+   $sth->fetch();   
+   $no_trans++; 
+   if($no_trans<=100)
+   {
+    $brokerage=((0.1/100)*$current_price)*$quantity;
+   }
+   elsif($no_trans<=1000)
+   {
+    $brokerage=((0.2/100)*$current_price)*$quantity;
+   }
+   else
+   {
+    $brokerage=((0.5/100)*$current_price)*$quantity;
+   }
+   $cash_bal=$cash_bal-$brokerage;
+   $sql = SQL::Abstract->new;
+   %data=(cash_bal=>$cash_bal,no_trans=>$no_trans);
+   %where=(excelid=>$excelid);
+   ($stmt, @bind) = $sql->update('portfolio',\%data,\%where);
+   $sth = $dbh->prepare($stmt);
+   $sth->execute(@bind); 
+   return 1;
+  }
+ }
+ $sth->finish();
+ return 0;
+}
